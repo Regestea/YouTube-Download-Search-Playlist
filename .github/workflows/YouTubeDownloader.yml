@@ -1,0 +1,766 @@
+name: 🎯 YouTube Downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: '🔄 Download Mode'
+        required: true
+        type: choice
+        options:
+          - multiple
+          - playlist
+          - channel
+          - search
+        default: 'multiple'
+      url:
+        description: '🎬 URL or Search Query or channel name (@ChannelName or ChannelName) | For multiple: URL1,URL2,URL3 | For search channels: @channel1,@channel2'
+        required: true
+        type: string
+      type:
+        description: '📦 Output Type'
+        required: true
+        type: choice
+        options:
+          - video
+          - audio
+        default: 'video'
+      quality:
+        description: 'Quality (video: 144/360/480/720/1080 | audio: 128/192/320)'
+        required: false
+        type: string
+        default: '720'
+      max_videos:
+        description: '🔢 Max results'
+        required: false
+        type: number
+        default: 10
+      split_threshold_mb:
+        description: '📦 Split > MB (0=no)'
+        required: false
+        type: number
+        default: 50
+
+env:
+  PYTHONUNBUFFERED: '1'
+  DEBIAN_FRONTEND: 'noninteractive'
+
+jobs:
+  download-and-process:
+    name: 🚀 YouTube Downloader
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 1
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}
+
+      - name: ⚡ Setup
+        run: |
+          python3 -c "import requests" 2>/dev/null || pip3 install -q requests
+          command -v yt-dlp &>/dev/null || pip3 install -q yt-dlp
+          command -v rar &>/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq rar)
+
+      - name: 🔗 Prepare
+        id: prep
+        run: |
+          M="${{ github.event.inputs.mode }}"
+          U="${{ github.event.inputs.url }}"
+          [[ "$M" == "channel" && "$U" != http* ]] && U="https://www.youtube.com/$([[ "$U" == @* ]] && echo "$U" || echo "@$U")"
+          echo "URL=$U" >> $GITHUB_OUTPUT
+          echo "MODE=$M" >> $GITHUB_OUTPUT
+
+      - name: 🎯 Download & Process
+        id: main
+        env:
+          MODE: ${{ steps.prep.outputs.MODE }}
+          URL: ${{ steps.prep.outputs.URL }}
+          TYPE: ${{ github.event.inputs.type }}
+          QUALITY: ${{ github.event.inputs.quality }}
+          MAX: ${{ github.event.inputs.max_videos }}
+          SPLIT: ${{ github.event.inputs.split_threshold_mb }}
+        run: |
+          python3 << 'PYEOF'
+          import os, json, time, re, subprocess, sys, hashlib
+          import requests as rq
+          from pathlib import Path
+          from datetime import datetime
+
+          M = os.environ['MODE']
+          U = os.environ['URL']
+          T = os.environ['TYPE']
+          Q = os.environ.get('QUALITY', '720')
+          MX = int(os.environ.get('MAX', '10'))
+          SP = int(os.environ.get('SPLIT', '50'))
+
+          API = 'https://hub.ytconvert.org/api/download'
+          H = {
+              'User-Agent': 'Mozilla/5.0',
+              'Accept': 'application/json',
+              'Referer': 'https://media.ytmp3.gg/',
+              'Content-Type': 'application/json',
+              'Origin': 'https://media.ytmp3.gg'
+          }
+
+          def safe_name(text, maxlen=40):
+              safe = re.sub(r'[^\w]', '_', text)[:maxlen]
+              safe = re.sub(r'_+', '_', safe).strip('_')
+              if not safe:
+                  safe = hashlib.md5(text.encode()).hexdigest()[:8]
+              return safe
+
+          def fm(n):
+              if not n:
+                  return 'N/A'
+              try:
+                  n = int(n)
+                  return f'{n/1e6:.1f}M' if n >= 1e6 else f'{n/1e3:.1f}K' if n >= 1e3 else str(n)
+              except:
+                  return str(n)
+
+          def gv(vid):
+              """Get video info AND channel name from actual video data"""
+              try:
+                  r = subprocess.run(
+                      ['yt-dlp', '--dump-json', '--no-warnings', '--no-check-certificate',
+                       f'https://youtube.com/watch?v={vid}'],
+                      capture_output=True, text=True, timeout=15
+                  )
+                  if r.returncode == 0 and r.stdout.strip():
+                      d = json.loads(r.stdout)
+                      channel = (d.get('channel') or d.get('uploader') or
+                                d.get('uploader_id') or d.get('creator') or 'Unknown')
+                      views = d.get('view_count')
+                      duration = d.get('duration', 0)
+                      channel_url = d.get('channel_url', '') or d.get('uploader_url', '')
+                      handle = None
+                      if channel_url:
+                          m = re.search(r'@([\w-]+)', channel_url)
+                          if m:
+                              handle = m.group(1)
+                      if not handle:
+                          handle = safe_name(channel, 30) if channel and channel != 'Unknown' else None
+                      return (channel.strip() if channel else 'Unknown', views, int(duration) if duration else 0, handle)
+              except:
+                  pass
+              return ('Unknown', None, 0, None)
+
+          def get_channel_from_url(url):
+              """Extract channel identifier from any YouTube URL"""
+              m = re.search(r'@([\w-]+)', url)
+              if m:
+                  return m.group(1)
+              m = re.search(r'channel/([\w-]+)', url)
+              if m:
+                  return m.group(1)
+              m = re.search(r'c/([\w-]+)', url)
+              if m:
+                  return m.group(1)
+              m = re.search(r'user/([\w-]+)', url)
+              if m:
+                  return m.group(1)
+              return None
+
+          def get_channel_from_playlist(playlist_url):
+              """Get the actual channel name from a playlist by looking at its first video"""
+              try:
+                  cmd = ['yt-dlp', '--flat-playlist', '--dump-json', '--playlist-end', '1',
+                         '--no-warnings', '--no-check-certificate', playlist_url]
+                  r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+                  if r.returncode == 0 and r.stdout.strip():
+                      d = json.loads(r.stdout.strip().split('\n')[0])
+                      vid = d.get('id', '')
+                      if vid:
+                          _, _, _, handle = gv(vid)
+                          if handle:
+                              return handle
+                      ch = d.get('channel') or d.get('uploader') or d.get('uploader_id')
+                      if ch:
+                          return safe_name(ch, 30)
+              except:
+                  pass
+              return None
+
+          def gvl(u, n):
+              """Get video list - returns (videos, channel_folder_name)"""
+              channel_folder = get_channel_from_url(u)
+
+              if not channel_folder and 'playlist' in u:
+                  print('   🔍 Detecting channel from playlist...')
+                  channel_folder = get_channel_from_playlist(u)
+
+              if not channel_folder:
+                  channel_folder = 'playlist_videos'
+
+              print(f'   📁 Folder: {channel_folder}_videos')
+
+              c = ['yt-dlp', '--flat-playlist', '--dump-json', '--no-warnings', '--no-check-certificate']
+              if n > 0:
+                  c.extend(['--playlist-end', str(n)])
+              c.append(u)
+              r = subprocess.run(c, capture_output=True, text=True, timeout=30)
+              v = []
+              for line in r.stdout.strip().split('\n'):
+                  if line and len(v) < n:
+                      try:
+                          d = json.loads(line)
+                          vid = d.get('id', '')
+                          if not vid:
+                              continue
+
+                          title = d.get('title', 'Untitled')[:60]
+                          print(f'   📊 [{len(v)+1}/{n}] {title}...')
+
+                          ch, vw, dr, _ = gv(vid)
+
+                          if not ch or ch == 'Unknown':
+                              ch = (d.get('channel') or d.get('uploader') or
+                                    d.get('uploader_id') or d.get('creator') or 'Unknown')
+                          if not vw:
+                              vw = d.get('view_count')
+                          if not dr:
+                              dr = d.get('duration', 0)
+
+                          v.append({
+                              'id': vid,
+                              't': title,
+                              'u': f'https://youtube.com/watch?v={vid}',
+                              'dr': int(dr) if dr else 0,
+                              'th': f'https://i.ytimg.com/vi/{vid}/maxresdefault.jpg',
+                              'c': str(ch).strip() if ch else 'Unknown',
+                              'v': fm(vw)
+                          })
+                      except Exception as e:
+                          print(f'      ⚠️ Skip: {str(e)[:40]}')
+                          continue
+
+              return v, channel_folder
+
+          def mkidx(v, cn, cd):
+              ts = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+              Path('./playlists').mkdir(exist_ok=True)
+              inf = cd / 'info'
+              inf.mkdir(parents=True, exist_ok=True)
+              idxf = f'playlists/{cn}_{ts}.md'
+
+              m = (f'# 📺 {cn}\n\n**{datetime.now():%Y-%m-%d %H:%M}** | **{len(v)} videos**\n\n'
+                   f'| # | Thumbnail | Title | Duration | Views |\n'
+                   f'|---|-----------|-------|----------|-------|\n')
+              for i, x in enumerate(v, 1):
+                  dur_str = f'{x["dr"]//60}:{x["dr"]%60:02d}' if x['dr'] else '?'
+                  m += f'| {i} | [<img src="{x["th"]}" width="80">]({x["u"]}) | [{x["t"]}]({x["u"]}) | {dur_str} | {x["v"]} |\n'
+
+              m += '\n---\n\n## 📝 Details\n\n'
+              for i, x in enumerate(v, 1):
+                  sn = f'v{i:03d}_{x["id"]}'
+                  dur_str = f'{x["dr"]//60} minutes' if x['dr'] else 'Unknown'
+                  info_md = (f'# 🎬 {x["t"]}\n\n'
+                            f'![Thumbnail]({x["th"]})\n\n'
+                            f'## Info\n\n'
+                            f'| Property | Value |\n|----------|-------|\n'
+                            f'| **Channel** | {x["c"]} |\n'
+                            f'| **Duration** | {dur_str} |\n'
+                            f'| **Views** | {x["v"]} |\n'
+                            f'| **Video ID** | `{x["id"]}` |\n'
+                            f'| **URL** | {x["u"]} |\n\n'
+                            f'## Thumbnail\n\n'
+                            f'<img src="{x["th"]}" width="640">\n\n'
+                            f'---\n*Downloaded: {datetime.now():%Y-%m-%d %H:%M}*')
+                  (inf / f'{sn}.md').write_text(info_md)
+                  m += (f'### {i}. {x["t"]}\n\n'
+                       f'![Thumbnail]({x["th"]})\n\n'
+                       f'- **{dur_str}** | **{x["v"]}** views | **{x["c"]}**\n'
+                       f'- 📄 [info/{sn}.md](info/{sn}.md)\n\n---\n\n')
+
+              Path(idxf).write_text(m)
+              print(f'📄 Index: {idxf}')
+              return idxf
+
+          def dl_video(u):
+              e = 'mp3' if T == 'audio' else 'mp4'
+              p = {'url': u, 'os': 'linux', 'output': {'type': 'audio' if T == 'audio' else 'video', 'format': e}}
+              if T == 'audio':
+                  p['audio'] = {'bitrate': f'{Q}k'}
+              else:
+                  p['output']['quality'] = f'{Q}p'
+
+              for retry in range(3):
+                  if retry > 0:
+                      print(f'   🔄 Retry {retry}/3...')
+                      time.sleep(5)
+                  try:
+                      rr = rq.post(API, json=p, headers=H, timeout=15)
+                      if rr.status_code != 200:
+                          continue
+                      d = rr.json()
+                      su = d.get('statusUrl')
+                      if not su:
+                          continue
+                      print('   ⏳ Converting...')
+                      for _ in range(60):
+                          time.sleep(2)
+                          try:
+                              sr = rq.get(su, headers=H, timeout=10)
+                              if sr.status_code == 200:
+                                  sd = sr.json()
+                                  st = sd.get('status', '')
+                                  if st == 'completed':
+                                      du = sd.get('downloadUrl')
+                                      if du:
+                                          return {'u': du, 'e': e}
+                                  elif st in ('failed', 'error'):
+                                      break
+                          except:
+                              continue
+                  except:
+                      time.sleep(2)
+              return None
+
+          def download_file(url, filepath):
+              try:
+                  dr = rq.get(url, headers=H, stream=True, timeout=600)
+                  if dr.status_code == 200:
+                      total = int(dr.headers.get('content-length', 0))
+                      done = 0
+                      with open(filepath, 'wb') as f:
+                          for chunk in dr.iter_content(65536):
+                              f.write(chunk)
+                              done += len(chunk)
+                              if total > 0 and done % (10 * 65536) == 0:
+                                  print(f'\r   ⬇️ {done*100/total:.1f}%', end='')
+                      print('\r   ⬇️ 100.0%')
+                      return filepath.stat().st_size
+              except Exception as e:
+                  print(f'   ❌ Download error: {e}')
+              return 0
+
+          def split_file(filepath, threshold_mb):
+              size_mb = filepath.stat().st_size / 1e6
+              if threshold_mb > 0 and size_mb > threshold_mb:
+                  print(f'   ✂️ Splitting ({size_mb:.0f}MB) into {threshold_mb}MB parts (RAR)...')
+                  parent = filepath.parent
+                  name = filepath.name
+                  archive = f'{name}.rar'
+                  subprocess.run(
+                      ['rar', 'a', '-idq', f'-v{threshold_mb}m', archive, name],
+                      cwd=parent,
+                      check=True
+                  )
+                  filepath.unlink()
+                  parts = sorted(parent.glob(f'{name}.r*'))
+                  print(f'   ✅ Split into {len(parts)} parts')
+                  return True
+              return False
+
+          def normalize_channel_input(channel_text):
+              ch = channel_text.strip()
+              if not ch:
+                  return None
+              if ch.startswith('http://') or ch.startswith('https://'):
+                  if '/videos' not in ch:
+                      ch = ch.rstrip('/') + '/videos'
+                  return ch
+              if not ch.startswith('@'):
+                  ch = '@' + ch
+              return f'https://www.youtube.com/{ch}/videos'
+
+          def get_latest_channel_videos(channel_input, max_results):
+              channel_url = normalize_channel_input(channel_input)
+              if not channel_url:
+                  return []
+
+              print(f'   🔍 Channel source: {channel_input} -> {channel_url}')
+
+              cmd = [
+                  'yt-dlp',
+                  '--flat-playlist',
+                  '--dump-json',
+                  '--playlist-end', str(max_results),
+                  '--no-warnings',
+                  '--no-check-certificate',
+                  channel_url
+              ]
+
+              r = subprocess.run(cmd, capture_output=True, text=True, timeout=40)
+              videos = []
+
+              if r.returncode != 0:
+                  print(f'   ⚠️ yt-dlp failed for {channel_input}')
+                  return videos
+
+              for line in r.stdout.strip().split('\n'):
+                  if not line or len(videos) >= max_results:
+                      continue
+                  try:
+                      d = json.loads(line)
+                      vid = d.get('id', '')
+                      if not vid:
+                          continue
+
+                      title = d.get('title', 'Untitled')[:60]
+                      ch, vw, dr, _ = gv(vid)
+
+                      if not ch or ch == 'Unknown':
+                          ch = (d.get('channel') or d.get('uploader') or
+                                d.get('uploader_id') or d.get('creator') or str(channel_input))
+
+                      if not vw:
+                          vw = d.get('view_count')
+                      if not dr:
+                          dr = d.get('duration', 0)
+
+                      videos.append({
+                          'id': vid,
+                          't': title,
+                          'u': f'https://youtube.com/watch?v={vid}',
+                          'dr': int(dr) if dr else 0,
+                          'th': f'https://i.ytimg.com/vi/{vid}/maxresdefault.jpg',
+                          'c': str(ch).strip() if ch else 'Unknown',
+                          'v': fm(vw),
+                          'source_channel': str(channel_input).strip()
+                      })
+
+                      print(f'      📹 [{len(videos)}/{max_results}] {title}')
+                  except Exception as e:
+                      print(f'      ⚠️ Skip: {str(e)[:40]}')
+                      continue
+
+              return videos
+
+          print(f'{"="*50}')
+          print(f'🎬 {M.upper()} MODE')
+          print(f'{"="*50}')
+
+          if M == 'multiple':
+              urls = [u.strip() for u in U.split(',') if u.strip()]
+              if not urls:
+                  print('❌ No valid URLs provided')
+                  sys.exit(1)
+
+              print(f'\n📋 Found {len(urls)} URLs to download\n{"="*50}')
+
+              cd = Path(f'downloads/multiple_{datetime.now().strftime("%Y%m%d_%H%M%S")}')
+              cd.mkdir(parents=True, exist_ok=True)
+
+              ok, fl = [], []
+
+              for idx, url in enumerate(urls, 1):
+                  print(f'\n📥 [{idx}/{len(urls)}] Processing: {url[:60]}...')
+
+                  vid_match = re.search(r'(?:v=|/)([\w-]{11})', url)
+                  vid = vid_match.group(1) if vid_match else f'video_{idx}'
+
+                  ch, vw, dr, handle = gv(vid)
+                  print(f'   Channel: {ch} | Duration: {dr//60}m | Views: {fm(vw)}')
+
+                  result = dl_video(url)
+                  if result:
+                      fp = cd / f'v{idx:03d}_{vid}.{result["e"]}'
+                      size = download_file(result['u'], fp)
+                      if size:
+                          print(f'   ✅ Downloaded ({size/1e6:.1f}MB)')
+                          split_file(fp, SP)
+                          ok.append(url)
+                      else:
+                          print('   ❌ Download failed')
+                          fl.append(url)
+                  else:
+                      print('   ❌ Conversion failed')
+                      fl.append(url)
+
+                  if idx < len(urls):
+                      print('   ⏳ Waiting...')
+                      time.sleep(2)
+
+              Path('/tmp/meta.json').write_text(json.dumps({
+                  'm': 'multiple', 'cd': str(cd), 'ok': len(ok), 'fl': len(fl), 'total': len(urls)
+              }))
+              print(f'\n{"="*50}')
+              print(f'📊 {len(ok)}/{len(urls)} downloaded successfully')
+              if fl:
+                  print('❌ Failed URLs:')
+                  for f in fl:
+                      print(f'   - {f}')
+              print(f'{"="*50}')
+
+          elif M == 'search':
+              # Multi-channel search mode: @channel1,@channel2
+              if ',' in U and all(x.strip() for x in U.split(',')):
+                  channels = [x.strip() for x in U.split(',') if x.strip()]
+                  all_videos = []
+
+                  print(f'\n📋 Multi-channel search: {len(channels)} channels | {MX} videos per channel\n{"="*50}')
+
+                  for idx, channel_input in enumerate(channels, 1):
+                      print(f'\n📺 [{idx}/{len(channels)}] {channel_input}')
+                      ch_videos = get_latest_channel_videos(channel_input, MX)
+
+                      if not ch_videos:
+                          print('   ⚠️ No videos found')
+                      else:
+                          all_videos.extend(ch_videos)
+                          print(f'   ✅ Collected {len(ch_videos)} videos')
+
+                      if idx < len(channels):
+                          time.sleep(1)
+
+                  if not all_videos:
+                      print('❌ No results')
+                      sys.exit(1)
+
+                  ts = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+                  Path('./searches').mkdir(exist_ok=True)
+                  qs = safe_name('_'.join([x.strip('@') for x in channels]), 60)
+                  f = f'searches/{qs}_{ts}.md'
+
+                  m = (
+                      f'# 🔍 Multi Channel Search\n\n'
+                      f'**Generated:** {datetime.now():%Y-%m-%d %H:%M}\n\n'
+                      f'**Channels:** {", ".join(channels)}\n\n'
+                      f'**Max results per channel:** {MX}\n\n'
+                      f'**Total results:** {len(all_videos)}\n\n'
+                      f'| # | Thumbnail | Title | Channel | Source | Views | Duration |\n'
+                      f'|---|-----------|-------|---------|--------|-------|----------|\n'
+                  )
+
+                  for i, x in enumerate(all_videos, 1):
+                      dur_str = f'{x["dr"]//60}:{x["dr"]%60:02d}' if x['dr'] else '?'
+                      m += (
+                          f'| {i} | [<img src="{x["th"]}" width="80">]({x["u"]}) '
+                          f'| [{x["t"]}]({x["u"]}) '
+                          f'| {x["c"][:20]} '
+                          f'| `{x.get("source_channel","")}` '
+                          f'| {x["v"]} '
+                          f'| {dur_str} |\n'
+                      )
+
+                  m += '\n---\n\n## 📝 Details\n\n'
+
+                  for i, x in enumerate(all_videos, 1):
+                      dur_str = f'{x["dr"]//60}:{x["dr"]%60:02d}' if x['dr'] else 'Unknown'
+                      m += (
+                          f'### {i}. {x["t"]}\n\n'
+                          f'<img src="{x["th"]}" width="640">\n\n'
+                          f'| Property | Value |\n'
+                          f'|----------|-------|\n'
+                          f'| Channel | {x["c"]} |\n'
+                          f'| Source Input | `{x.get("source_channel","")}` |\n'
+                          f'| Duration | {dur_str} |\n'
+                          f'| Views | {x["v"]} |\n'
+                          f'| ID | `{x["id"]}` |\n'
+                          f'| URL | {x["u"]} |\n\n'
+                          f'---\n\n'
+                      )
+
+                  Path(f).write_text(m)
+                  Path('/tmp/meta.json').write_text(json.dumps({'m': 'search', 'ok': 0}))
+                  print(f'✅ {f}')
+
+              else:
+                  # Original single search query mode
+                  v, _ = gvl(f'ytsearch{MX}:{U}', MX)
+                  if not v:
+                      print('❌ No results')
+                      sys.exit(1)
+
+                  ts = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+                  Path('./searches').mkdir(exist_ok=True)
+                  qs = safe_name(U, 30)
+                  f = f'searches/{qs}_{ts}.md'
+                  m = (f'# 🔍 Search: {U}\n\n**{datetime.now():%Y-%m-%d %H:%M}** | **{len(v)} results**\n\n'
+                       f'| # | Thumbnail | Title | Channel | Views | Duration |\n'
+                       f'|---|-----------|-------|---------|-------|----------|\n')
+                  for i, x in enumerate(v, 1):
+                      dur_str = f'{x["dr"]//60}:{x["dr"]%60:02d}' if x['dr'] else '?'
+                      m += f'| {i} | [<img src="{x["th"]}" width="80">]({x["u"]}) | [{x["t"]}]({x["u"]}) | {x["c"][:20]} | {x["v"]} | {dur_str} |\n'
+                  m += '\n---\n\n'
+                  for i, x in enumerate(v, 1):
+                      dur_str = f'{x["dr"]//60}:{x["dr"]%60:02d}' if x['dr'] else 'Unknown'
+                      m += (f'### {i}. {x["t"]}\n\n<img src="{x["th"]}" width="640">\n\n'
+                           f'| Property | Value |\n|----------|-------|\n'
+                           f'| Channel | {x["c"]} |\n| Duration | {dur_str} |\n'
+                           f'| Views | {x["v"]} |\n| ID | `{x["id"]}` |\n| URL | {x["u"]} |\n\n---\n\n')
+                  Path(f).write_text(m)
+                  Path('/tmp/meta.json').write_text(json.dumps({'m': 'search', 'ok': 0}))
+                  print(f'✅ {f}')
+
+          elif M in ('playlist', 'channel'):
+              print('\n📋 Extracting videos...')
+              v, cn = gvl(U, MX)
+              if not v:
+                  print('❌ No videos found')
+                  sys.exit(1)
+
+              cd = Path(f'downloads/{cn}_videos')
+              cd.mkdir(parents=True, exist_ok=True)
+
+              print('\n📝 Creating index...')
+              mkidx(v, cn, cd)
+
+              ok, fl = [], []
+              print(f'\n📥 Downloading {len(v)} videos...\n{"="*50}')
+
+              for i, x in enumerate(v, 1):
+                  print(f'\n📥 [{i}/{len(v)}] {x["t"]}')
+                  print(f'   Channel: {x["c"]} | Duration: {x["dr"]//60}m | Views: {x["v"]}')
+
+                  result = dl_video(x['u'])
+                  if result:
+                      fp = cd / f'v{i:03d}_{x["id"]}.{result["e"]}'
+                      size = download_file(result['u'], fp)
+                      if size:
+                          print(f'   ✅ Downloaded ({size/1e6:.1f}MB)')
+                          split_file(fp, SP)
+                          ok.append(x['t'])
+                      else:
+                          print('   ❌ Download failed')
+                          fl.append(x['t'])
+                  else:
+                      print('   ❌ Conversion failed')
+                      fl.append(x['t'])
+
+                  if i < len(v):
+                      print('   ⏳ Waiting...')
+                      time.sleep(2)
+
+              Path('/tmp/meta.json').write_text(json.dumps({
+                  'm': M, 'cd': str(cd), 'ok': len(ok), 'fl': len(fl), 'total': len(v)
+              }))
+              print(f'\n{"="*50}')
+              print(f'📊 {len(ok)}/{len(v)} downloaded successfully')
+              if fl:
+                  print(f'❌ Failed: {fl}')
+              print(f'{"="*50}')
+
+          else:
+              print('❌ Invalid mode. Allowed: multiple, playlist, channel, search')
+              sys.exit(1)
+
+          PYEOF
+
+      - name: 📤 Push Files
+        run: |
+          # Set script to exit on any error
+          set -e
+          
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📤 PUSHING FILES TO GITHUB IN BATCHES"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          # Configure git user for the commit
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Define the size limit for each commit in Megabytes
+          COMMIT_SIZE_LIMIT_MB=400
+          # Convert limit to Kilobytes for shell integer arithmetic
+          LIMIT_KB=$((COMMIT_SIZE_LIMIT_MB * 1024))
+
+          # --- Function to commit and push a batch of files ---
+          process_commit() {
+            # Exit if there are no files to commit
+            if [ ${#files_for_commit[@]} -eq 0 ]; then
+              return
+            fi
+
+            echo
+            echo "📦 Preparing commit #${commit_count} with ${#files_for_commit[@]} files (Total size: ~${current_size_kb} KB)..."
+            
+            # Add only the files for the current batch
+            git add "${files_for_commit[@]}"
+
+            TIMESTAMP=$(date +"%Y-%m-%d %H:%M")
+            git commit -m "📚 Batch ${commit_count}: Add media files ($TIMESTAMP)" -m "Commit includes ${#files_for_commit[@]} files, totaling approx. ${current_size_kb} KB." --quiet
+
+            echo "🚀 Pushing commit #${commit_count}..."
+            # Retry loop for pushing
+            for i in {1..5}; do
+              # Pull rebase to handle potential conflicts before pushing
+              if git pull --rebase --autostash --quiet && git push --quiet; then
+                echo "   ✅ Push successful on attempt $i."
+                # Reset variables for the next batch
+                commit_count=$((commit_count + 1))
+                files_for_commit=()
+                current_size_kb=0
+                return 0
+              fi
+              echo "   ⚠️ Push attempt $i failed. Retrying in $((i*3)) seconds..."
+              sleep $((i*3))
+            done
+
+            # If all retries fail, exit with an error
+            echo "❌ CRITICAL: Failed to push commit #${commit_count} after 5 attempts."
+            exit 1
+          }
+
+          # --- Main Logic ---
+          # Initialize variables
+          current_size_kb=0
+          commit_count=1
+          files_for_commit=()
+
+          # First, add and commit any small metadata/markdown files separately
+          echo "📋 Checking for metadata files..."
+          metadata_files=()
+          # Find new (untracked) metadata files
+          while IFS= read -r -d '' file; do
+              if git ls-files --others --exclude-standard -- "$file" | grep -q .; then
+                  metadata_files+=("$file")
+              fi
+          done < <(find . -maxdepth 2 -type f \( -name "*.md" -o -name "info.json" \) -print0)
+
+          if [ ${#metadata_files[@]} -gt 0 ]; then
+              echo "📝 Found ${#metadata_files[@]} new metadata files. Committing first."
+              git add "${metadata_files[@]}"
+              git commit -m "📝 Add metadata and index files" --quiet
+              git push
+          else
+              echo "   No new metadata files to commit."
+          fi
+          
+          echo
+          echo "🗂️ Scanning for large media files to batch..."
+          # Use Process Substitution `< <(...)` to run the loop in the current shell.
+          # This is the key fix for the subshell issue.
+          while IFS= read -r file; do
+              # Ensure file exists and is a regular file before processing
+              if [ ! -f "$file" ]; then
+                continue
+              fi
+              
+              # Get file size in Kilobytes
+              size_kb=$(du -k "$file" | awk '{print $1}')
+
+              # If adding the next file exceeds the limit, commit the current batch first.
+              if (( current_size_kb > 0 && current_size_kb + size_kb > LIMIT_KB )); then
+                process_commit
+              fi
+
+              # Add the new file to the upcoming batch
+              files_for_commit+=("$file")
+              current_size_kb=$((current_size_kb + size_kb))
+              echo "   [Batch #${commit_count}] Queued: $file (${size_kb} KB)"
+
+          done < <(git ls-files --others --exclude-standard | grep -E '^(downloads|playlists|searches)/')
+
+          # After the loop, commit any remaining files in the last batch
+          if [ ${#files_for_commit[@]} -gt 0 ]; then
+            echo "  Finalizing the last batch..."
+            process_commit
+          else
+            # This message will now correctly appear only if no new media files were found at all
+            echo "✅ No new media files to push."
+          fi
+
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "✅ All files pushed successfully."
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
