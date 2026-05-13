@@ -406,7 +406,7 @@ jobs:
                       if not vid:
                           continue
 
-                      title = d.get('title', 'Untitled')[:60]
+                      title = d.get('title', 'Untitled')[:390]
                       ch, vw, dr, _ = gv(vid)
 
                       if not ch or ch == 'Unknown':
