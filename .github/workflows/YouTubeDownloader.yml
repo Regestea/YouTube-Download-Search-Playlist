@@ -1,49 +1,21 @@
 name: 🎯 YouTube Downloader
 
 on:
-  workflow_dispatch:
-    inputs:
-      mode:
-        description: '🔄 Download Mode'
-        required: true
-        type: choice
-        options:
-          - multiple
-          - playlist
-          - channel
-          - search
-        default: 'multiple'
-      url:
-        description: '🎬 URL or Search Query or channel name (@ChannelName or ChannelName) | For multiple: URL1,URL2,URL3 | For search channels: @channel1,@channel2'
-        required: true
-        type: string
-      type:
-        description: '📦 Output Type'
-        required: true
-        type: choice
-        options:
-          - video
-          - audio
-        default: 'video'
-      quality:
-        description: 'Quality (video: 144/360/480/720/1080 | audio: 128/192/320)'
-        required: false
-        type: string
-        default: '720'
-      max_videos:
-        description: '🔢 Max results'
-        required: false
-        type: number
-        default: 10
-      split_threshold_mb:
-        description: '📦 Split > MB (0=no)'
-        required: false
-        type: number
-        default: 50
+  push:
+    branches:
+      - main # در صورت نیاز می‌توانید نام برنچ را تغییر دهید (مثلا master)
 
+# 🔻 تنظیمات ورودی خود را اینجا وارد کنید 🔻
 env:
+  TARGET_MODE: 'multiple'          # گزینه‌ها: multiple, playlist, channel, search
+  TARGET_URL: 'URL1,URL2'          # آدرس ویدیو، کانال یا عبارت جستجو
+  TARGET_TYPE: 'video'             # گزینه‌ها: video, audio
+  TARGET_QUALITY: '720'            # ویدیو: 144/360/480/720/1080 | صدا: 128/192/320
+  MAX_VIDEOS: 10                   # حداکثر تعداد نتیجه
+  SPLIT_MB: 50                     # حجم تقسیم فایل‌ها به مگابایت
   PYTHONUNBUFFERED: '1'
   DEBIAN_FRONTEND: 'noninteractive'
+# 🔺 پایان تنظیمات ورودی 🔺
 
 jobs:
   download-and-process:
@@ -73,8 +45,8 @@ jobs:
       - name: 🔗 Prepare
         id: prep
         run: |
-          M="${{ github.event.inputs.mode }}"
-          U="${{ github.event.inputs.url }}"
+          M="${{ env.TARGET_MODE }}"
+          U="${{ env.TARGET_URL }}"
           [[ "$M" == "channel" && "$U" != http* ]] && U="https://www.youtube.com/$([[ "$U" == @* ]] && echo "$U" || echo "@$U")"
           echo "URL=$U" >> $GITHUB_OUTPUT
           echo "MODE=$M" >> $GITHUB_OUTPUT
@@ -84,10 +56,10 @@ jobs:
         env:
           MODE: ${{ steps.prep.outputs.MODE }}
           URL: ${{ steps.prep.outputs.URL }}
-          TYPE: ${{ github.event.inputs.type }}
-          QUALITY: ${{ github.event.inputs.quality }}
-          MAX: ${{ github.event.inputs.max_videos }}
-          SPLIT: ${{ github.event.inputs.split_threshold_mb }}
+          TYPE: ${{ env.TARGET_TYPE }}
+          QUALITY: ${{ env.TARGET_QUALITY }}
+          MAX: ${{ env.MAX_VIDEOS }}
+          SPLIT: ${{ env.SPLIT_MB }}
         run: |
           python3 << 'PYEOF'
           import os, json, time, re, subprocess, sys, hashlib
@@ -128,7 +100,6 @@ jobs:
                   return str(n)
 
           def gv(vid):
-              """Get video info AND channel name from actual video data"""
               try:
                   r = subprocess.run(
                       ['yt-dlp', '--dump-json', '--no-warnings', '--no-check-certificate',
@@ -155,7 +126,6 @@ jobs:
               return ('Unknown', None, 0, None)
 
           def get_channel_from_url(url):
-              """Extract channel identifier from any YouTube URL"""
               m = re.search(r'@([\w-]+)', url)
               if m:
                   return m.group(1)
@@ -171,7 +141,6 @@ jobs:
               return None
 
           def get_channel_from_playlist(playlist_url):
-              """Get the actual channel name from a playlist by looking at its first video"""
               try:
                   cmd = ['yt-dlp', '--flat-playlist', '--dump-json', '--playlist-end', '1',
                          '--no-warnings', '--no-check-certificate', playlist_url]
@@ -191,7 +160,6 @@ jobs:
               return None
 
           def gvl(u, n):
-              """Get video list - returns (videos, channel_folder_name)"""
               channel_folder = get_channel_from_url(u)
 
               if not channel_folder and 'playlist' in u:
@@ -493,7 +461,6 @@ jobs:
               print(f'{"="*50}')
 
           elif M == 'search':
-              # Multi-channel search mode: @channel1,@channel2
               if ',' in U and all(x.strip() for x in U.split(',')):
                   channels = [x.strip() for x in U.split(',') if x.strip()]
                   all_videos = []
@@ -566,7 +533,6 @@ jobs:
                   print(f'✅ {f}')
 
               else:
-                  # Original single search query mode
                   v, _ = gvl(f'ytsearch{MX}:{U}', MX)
                   if not v:
                       print('❌ No results')
@@ -649,45 +615,36 @@ jobs:
 
       - name: 📤 Push Files
         run: |
-          # Set script to exit on any error
           set -e
           
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo "📤 PUSHING FILES TO GITHUB IN BATCHES"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-          # Configure git user for the commit
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # Define the size limit for each commit in Megabytes
           COMMIT_SIZE_LIMIT_MB=400
-          # Convert limit to Kilobytes for shell integer arithmetic
           LIMIT_KB=$((COMMIT_SIZE_LIMIT_MB * 1024))
 
-          # --- Function to commit and push a batch of files ---
           process_commit() {
-            # Exit if there are no files to commit
             if [ ${#files_for_commit[@]} -eq 0 ]; then
               return
             fi
 
             echo
             echo "📦 Preparing commit #${commit_count} with ${#files_for_commit[@]} files (Total size: ~${current_size_kb} KB)..."
-            
-            # Add only the files for the current batch
+          
             git add "${files_for_commit[@]}"
 
             TIMESTAMP=$(date +"%Y-%m-%d %H:%M")
-            git commit -m "📚 Batch ${commit_count}: Add media files ($TIMESTAMP)" -m "Commit includes ${#files_for_commit[@]} files, totaling approx. ${current_size_kb} KB." --quiet
+            # نکته بسیار مهم: اضافه شدن [skip ci] برای جلوگیری از اجرای مجدد اکشن و ایجاد حلقه بی‌نهایت
+            git commit -m "📚 Batch ${commit_count}: Add media files ($TIMESTAMP) [skip ci]" -m "Commit includes ${#files_for_commit[@]} files, totaling approx. ${current_size_kb} KB." --quiet
 
             echo "🚀 Pushing commit #${commit_count}..."
-            # Retry loop for pushing
             for i in {1..5}; do
-              # Pull rebase to handle potential conflicts before pushing
               if git pull --rebase --autostash --quiet && git push --quiet; then
                 echo "   ✅ Push successful on attempt $i."
-                # Reset variables for the next batch
                 commit_count=$((commit_count + 1))
                 files_for_commit=()
                 current_size_kb=0
@@ -697,21 +654,16 @@ jobs:
               sleep $((i*3))
             done
 
-            # If all retries fail, exit with an error
             echo "❌ CRITICAL: Failed to push commit #${commit_count} after 5 attempts."
             exit 1
           }
 
-          # --- Main Logic ---
-          # Initialize variables
           current_size_kb=0
           commit_count=1
           files_for_commit=()
 
-          # First, add and commit any small metadata/markdown files separately
           echo "📋 Checking for metadata files..."
           metadata_files=()
-          # Find new (untracked) metadata files
           while IFS= read -r -d '' file; do
               if git ls-files --others --exclude-standard -- "$file" | grep -q .; then
                   metadata_files+=("$file")
@@ -721,7 +673,8 @@ jobs:
           if [ ${#metadata_files[@]} -gt 0 ]; then
               echo "📝 Found ${#metadata_files[@]} new metadata files. Committing first."
               git add "${metadata_files[@]}"
-              git commit -m "📝 Add metadata and index files" --quiet
+              # نکته بسیار مهم: اضافه شدن [skip ci]
+              git commit -m "📝 Add metadata and index files [skip ci]" --quiet
               git push
           else
               echo "   No new metadata files to commit."
@@ -729,35 +682,27 @@ jobs:
           
           echo
           echo "🗂️ Scanning for large media files to batch..."
-          # Use Process Substitution `< <(...)` to run the loop in the current shell.
-          # This is the key fix for the subshell issue.
           while IFS= read -r file; do
-              # Ensure file exists and is a regular file before processing
               if [ ! -f "$file" ]; then
                 continue
               fi
-              
-              # Get file size in Kilobytes
+          
               size_kb=$(du -k "$file" | awk '{print $1}')
 
-              # If adding the next file exceeds the limit, commit the current batch first.
               if (( current_size_kb > 0 && current_size_kb + size_kb > LIMIT_KB )); then
                 process_commit
               fi
 
-              # Add the new file to the upcoming batch
               files_for_commit+=("$file")
               current_size_kb=$((current_size_kb + size_kb))
               echo "   [Batch #${commit_count}] Queued: $file (${size_kb} KB)"
 
           done < <(git ls-files --others --exclude-standard | grep -E '^(downloads|playlists|searches)/')
 
-          # After the loop, commit any remaining files in the last batch
           if [ ${#files_for_commit[@]} -gt 0 ]; then
             echo "  Finalizing the last batch..."
             process_commit
           else
-            # This message will now correctly appear only if no new media files were found at all
             echo "✅ No new media files to push."
           fi
 
