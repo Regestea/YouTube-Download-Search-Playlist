@@ -7,6 +7,7 @@ on:
 
 # 🔻 تنظیمات ورودی خود را اینجا وارد کنید 🔻
 env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true' # Added to fix Node 20 deprecation warning
   TARGET_MODE: 'multiple'          # گزینه‌ها: multiple, playlist, channel, search
   TARGET_URL: 'URL1,URL2'          # آدرس ویدیو، کانال یا عبارت جستجو
   TARGET_TYPE: 'video'             # گزینه‌ها: video, audio
