@@ -13,7 +13,7 @@ env:
   TARGET_TYPE: 'video'             # گزینه‌ها: video, audio
   TARGET_QUALITY: '720'            # ویدیو: 144/360/480/720/1080 | صدا: 128/192/320
   MAX_VIDEOS: 10                   # حداکثر تعداد نتیجه
-  SPLIT_MB: 50                     # حجم تقسیم فایل‌ها به مگابایت
+  SPLIT_MB: 80                     # حجم تقسیم فایل‌ها به مگابایت
   PYTHONUNBUFFERED: '1'
   DEBIAN_FRONTEND: 'noninteractive'
 # 🔺 پایان تنظیمات ورودی 🔺
@@ -22,7 +22,7 @@ jobs:
   download-and-process:
     name: 🚀 YouTube Downloader
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 60
     permissions:
       contents: write
     
@@ -262,9 +262,9 @@ jobs:
               else:
                   p['output']['quality'] = f'{Q}p'
 
-              for retry in range(3):
+              for retry in range(100):
                   if retry > 0:
-                      print(f'   🔄 Retry {retry}/3...')
+                      print(f'   🔄 Retry {retry}/100...')
                       time.sleep(5)
                   try:
                       rr = rq.post(API, json=p, headers=H, timeout=15)
