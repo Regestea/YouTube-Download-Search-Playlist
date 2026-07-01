@@ -109,6 +109,7 @@ jobs:
                   )
                   if r.returncode == 0 and r.stdout.strip():
                       d = json.loads(r.stdout)
+                      title = d.get('title') or 'Untitled'
                       channel = (d.get('channel') or d.get('uploader') or
                                 d.get('uploader_id') or d.get('creator') or 'Unknown')
                       views = d.get('view_count')
@@ -121,10 +122,10 @@ jobs:
                               handle = m.group(1)
                       if not handle:
                           handle = safe_name(channel, 30) if channel and channel != 'Unknown' else None
-                      return (channel.strip() if channel else 'Unknown', views, int(duration) if duration else 0, handle)
+                      return (title.strip(), channel.strip() if channel else 'Unknown', views, int(duration) if duration else 0, handle)
               except:
                   pass
-              return ('Unknown', None, 0, None)
+              return ('Untitled', 'Unknown', None, 0, None)
 
           def get_channel_from_url(url):
               m = re.search(r'@([\w-]+)', url)
@@ -150,7 +151,7 @@ jobs:
                       d = json.loads(r.stdout.strip().split('\n')[0])
                       vid = d.get('id', '')
                       if vid:
-                          _, _, _, handle = gv(vid)
+                          _, _, _, _, handle = gv(vid)
                           if handle:
                               return handle
                       ch = d.get('channel') or d.get('uploader') or d.get('uploader_id')
@@ -189,7 +190,7 @@ jobs:
                           title = d.get('title', 'Untitled')[:60]
                           print(f'   📊 [{len(v)+1}/{n}] {title}...')
 
-                          ch, vw, dr, _ = gv(vid)
+                          _, ch, vw, dr, _ = gv(vid)
 
                           if not ch or ch == 'Unknown':
                               ch = (d.get('channel') or d.get('uploader') or
@@ -376,7 +377,7 @@ jobs:
                           continue
 
                       title = d.get('title', 'Untitled')[:390]
-                      ch, vw, dr, _ = gv(vid)
+                      _, ch, vw, dr, _ = gv(vid)
 
                       if not ch or ch == 'Unknown':
                           ch = (d.get('channel') or d.get('uploader') or
@@ -428,12 +429,14 @@ jobs:
                   vid_match = re.search(r'(?:v=|/)([\w-]{11})', url)
                   vid = vid_match.group(1) if vid_match else f'video_{idx}'
 
-                  ch, vw, dr, handle = gv(vid)
+                  title, ch, vw, dr, handle = gv(vid)
+                  safe_title = safe_name(title, 60)
+                  print(f'   Title: {title}')
                   print(f'   Channel: {ch} | Duration: {dr//60}m | Views: {fm(vw)}')
 
                   result = dl_video(url)
                   if result:
-                      fp = cd / f'v{idx:03d}_{vid}.{result["e"]}'
+                      fp = cd / f'v{idx:03d}_{safe_title}.{result["e"]}'
                       size = download_file(result['u'], fp)
                       if size:
                           print(f'   ✅ Downloaded ({size/1e6:.1f}MB)')
@@ -580,9 +583,10 @@ jobs:
                   print(f'\n📥 [{i}/{len(v)}] {x["t"]}')
                   print(f'   Channel: {x["c"]} | Duration: {x["dr"]//60}m | Views: {x["v"]}')
 
+                  safe_title = safe_name(x['t'], 60)
                   result = dl_video(x['u'])
                   if result:
-                      fp = cd / f'v{i:03d}_{x["id"]}.{result["e"]}'
+                      fp = cd / f'v{i:03d}_{safe_title}.{result["e"]}'
                       size = download_file(result['u'], fp)
                       if size:
                           print(f'   ✅ Downloaded ({size/1e6:.1f}MB)')
